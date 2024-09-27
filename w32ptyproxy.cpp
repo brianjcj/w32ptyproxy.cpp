@@ -11,14 +11,69 @@
 HRESULT CreatePseudoConsoleAndPipes(HPCON*, HANDLE*, HANDLE*, short, short);
 HRESULT InitializeStartupInfoAttachedToPseudoConsole(STARTUPINFOEX*, HPCON);
 void __cdecl PipeListener(LPVOID);
+void __cdecl namePipeListener(LPVOID);
+
+
+HRESULT(WINAPI* pCreatePseudoConsole)(COORD, HANDLE, HANDLE, DWORD, HPCON*);
+HRESULT(WINAPI* pResizePseudoConsole)(HPCON, COORD);
+void(WINAPI* pClosePseudoConsole)(HPCON);
+
+const DWORD PSUEDOCONSOLE_INHERIT_CURSOR = 0x1;
+const DWORD PSEUDOCONSOLE_RESIZE_QUIRK = 0x2;
+const DWORD PSEUDOCONSOLE_WIN32_INPUT_MODE = 0x4;
+
+
+bool static odyn_conpty_init(void)
+{
+    HINSTANCE hGetProcIDDLL = LoadLibrary(L"conpty.dll");
+
+    if (hGetProcIDDLL == NULL) {
+        perror("cannot load conpty.dll");
+        return false;
+    }
+    static struct {
+        const char* name;
+        FARPROC* ptr;
+    } conpty_entry[] = {
+      { "CreatePseudoConsole", (FARPROC*)&pCreatePseudoConsole },
+      { "ResizePseudoConsole", (FARPROC*)&pResizePseudoConsole },
+      { "ClosePseudoConsole", (FARPROC*)&pClosePseudoConsole },
+      { NULL, NULL }
+    };
+
+    for (int i = 0; conpty_entry[i].name != NULL
+        && conpty_entry[i].ptr != NULL; ++i)
+    {
+        if ((*conpty_entry[i].ptr = (FARPROC)GetProcAddress(hGetProcIDDLL,
+            conpty_entry[i].name)) == NULL)
+        {
+            perror("failed to find function");
+            return false;
+        }
+        else
+        {
+            printf("function %s loaded\n", conpty_entry[i].name);
+        }
+    }
+
+    return true;
+}
+
+HPCON hPC{ INVALID_HANDLE_VALUE };
 
 int wmain(int argc, wchar_t** argv)
 {
+    if (!odyn_conpty_init()) {
+        return -1;
+    }
+
     wchar_t szCommand[]{ L"cmd.exe" };
     //wchar_t szCommand[]{ L"powershell.exe" };
     //wchar_t szCommand[]{ L"pwsh.exe" };
 
     wchar_t* pCmd = NULL;
+
+    const wchar_t* pipeName = NULL;
 
     if (argc < 2)
     {
@@ -36,6 +91,16 @@ int wmain(int argc, wchar_t** argv)
         rows = (short)wcstol(argv[2], NULL, 10);
         cols = (short)wcstol(argv[3], NULL, 10);
     }
+
+    if (argc >= 5) {
+        pipeName = argv[4];
+    }
+    else
+    {
+        pipeName = L"\\\\.\\pipe\\vtermPipe-1234";
+    }
+
+    printf("pipe name:%s\n", pipeName);
 
     HRESULT hr{ E_UNEXPECTED };
     HANDLE hConsole = { GetStdHandle(STD_OUTPUT_HANDLE) };
@@ -77,7 +142,6 @@ int wmain(int argc, wchar_t** argv)
 
     if (S_OK == hr)
     {
-        HPCON hPC{ INVALID_HANDLE_VALUE };
 
         //  Create the Pseudo Console and pipes to it
         HANDLE hPipeIn{ INVALID_HANDLE_VALUE };
@@ -101,7 +165,7 @@ int wmain(int argc, wchar_t** argv)
                     NULL,                           // Process handle not inheritable
                     NULL,                           // Thread handle not inheritable
                     FALSE,                          // Inherit handles
-                    EXTENDED_STARTUPINFO_PRESENT,   // Creation flags
+                    EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,   // Creation flags
                     NULL,                           // Use parent's environment block
                     NULL,                           // Use parent's starting directory
                     &startupInfo.StartupInfo,       // Pointer to STARTUPINFO
@@ -111,6 +175,27 @@ int wmain(int argc, wchar_t** argv)
 
                 if (S_OK == hr)
                 {
+
+                    // create a name pipe
+
+                    HANDLE hNamePipe = CreateNamedPipe(pipeName,
+                        PIPE_ACCESS_DUPLEX,
+                        // PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,   // FILE_FLAG_FIRST_PIPE_INSTANCE is not needed but forces CreateNamedPipe(..) to fail if the pipe already exists...
+                        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                        PIPE_UNLIMITED_INSTANCES, //1,
+                        1024 * 16,
+                        1024 * 16,
+                        NMPWAIT_USE_DEFAULT_WAIT,
+                        NULL);
+                    if (hNamePipe == INVALID_HANDLE_VALUE)
+                    {
+                        printf("failed to create name pipe");
+                        return EXIT_FAILURE;
+                    }
+
+                    HANDLE hPipeListenerThread{ reinterpret_cast<HANDLE>(_beginthread(namePipeListener, 0, hNamePipe)) };
+
+
                     const DWORD BUFF_SIZE{ 512 };
                     char szBuffer[BUFF_SIZE]{};
                     HANDLE hConsoleIn{ GetStdHandle(STD_INPUT_HANDLE) };
@@ -161,7 +246,7 @@ int wmain(int argc, wchar_t** argv)
             }
 
             // Close ConPTY - this will terminate client process if running
-            ClosePseudoConsole(hPC);
+            pClosePseudoConsole(hPC);
 
             // Clean-up the pipes
             if (INVALID_HANDLE_VALUE != hPipeOut) CloseHandle(hPipeOut);
@@ -197,7 +282,9 @@ HRESULT CreatePseudoConsoleAndPipes(HPCON* phPC, HANDLE* phPipeIn, HANDLE* phPip
         }
 
         // Create the Pseudo Console of the required size, attached to the PTY-end of the pipes
-        hr = CreatePseudoConsole(consoleSize, hPipePTYIn, hPipePTYOut, 0, phPC);
+        hr = pCreatePseudoConsole(consoleSize, hPipePTYIn, hPipePTYOut,
+            PSUEDOCONSOLE_INHERIT_CURSOR | PSEUDOCONSOLE_RESIZE_QUIRK | PSEUDOCONSOLE_WIN32_INPUT_MODE,
+            phPC);
 
 
         // Note: We can close the handles to the PTY-end of the pipes here
@@ -300,4 +387,40 @@ void __cdecl PipeListener(LPVOID pipe)
 
     printf("PipeListener quit!\n");
     exit(-1);
+}
+
+void __cdecl namePipeListener(LPVOID pipe)
+{
+    HANDLE hPipe{ pipe };
+    char buffer[1024];
+    DWORD dwRead;
+
+    while (hPipe != INVALID_HANDLE_VALUE) {
+        if (ConnectNamedPipe(hPipe, NULL) != FALSE)   // wait for someone to connect to the pipe
+        {
+            while (ReadFile(hPipe, buffer, sizeof(buffer) - 1, &dwRead, NULL) != FALSE)
+            {
+
+                byte msgType = buffer[0];
+
+                if (msgType == 1) {
+                    short* ps = (short*)(buffer + 1);
+                    short rows = *ps;
+                    short cols = *(ps + 1);
+                    printf("msg type: %d, rows: %d, cols: %d\n", msgType, rows, cols);
+
+                    COORD consoleSize{};
+                    consoleSize.X = cols;
+                    consoleSize.Y = rows;
+
+                    pResizePseudoConsole(hPC, consoleSize);
+                }
+
+            }
+        }
+
+        DisconnectNamedPipe(hPipe);
+    }
+
+
 }
